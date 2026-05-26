@@ -1,5 +1,6 @@
 import { type NextAuthOptions } from "next-auth";
 import GitHubProvider from "next-auth/providers/github";
+import { syncGitHubAchievementsForUser } from "./github-achievements";
 import { supabaseAdmin } from "./supabase";
 
 const SESSION_MAX_AGE = 30 * 24 * 60 * 60;
@@ -18,7 +19,7 @@ export const authOptions: NextAuthOptions = {
       clientId: process.env.GITHUB_ID ?? "",
       clientSecret: process.env.GITHUB_SECRET ?? "",
       authorization: {
-        params: { scope: "read:user user:email repo read:discussion" },
+        params: { scope: "read:user user:email read:discussion" },
       },
     }),
   ],
@@ -37,7 +38,8 @@ export const authOptions: NextAuthOptions = {
     async signIn({ account, profile }) {
       if (account?.provider === "github" && profile) {
         const p = profile as { id: number; login: string; email?: string };
-        await supabaseAdmin.from("users").upsert(
+        
+        let { data: user, error } = await supabaseAdmin.from("users").upsert(
           {
             github_id: String(p.id),
             github_login: p.login,
@@ -45,7 +47,39 @@ export const authOptions: NextAuthOptions = {
             updated_at: new Date().toISOString(),
           },
           { onConflict: "github_id" }
-        );
+        ).select("id").single();
+
+        // If the email column does not exist yet (migration pending),
+        // PostgREST returns a 42703 error. Fallback to upsert without email.
+        if (error && error.code === "42703") {
+          const fallback = await supabaseAdmin.from("users").upsert(
+            {
+              github_id: String(p.id),
+              github_login: p.login,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "github_id" }
+          ).select("id").single();
+          user = fallback.data;
+          error = fallback.error;
+        }
+
+        if (error) {
+          console.error("Supabase upsert error during sign in:", error);
+        }
+
+        if (user?.id && account.access_token) {
+          try {
+            await syncGitHubAchievementsForUser({
+              userId: user.id,
+              githubLogin: p.login,
+              token: account.access_token,
+              force: true,
+            });
+          } catch (error) {
+            console.error("GitHub achievements sync failed:", error);
+          }
+        }
       }
       return true;
     },
